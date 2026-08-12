@@ -1,0 +1,21 @@
+{
+  "object_categories": [
+    {"id": 1, "name": "left_hand"},
+    {"id": 2, "name": "right_hand"},
+    {"id": 3, "name": "needle_driver"},
+    {"id": 4, "name": "foreceps"},
+    {"id": 5, "name": "scissors"}
+  ],
+  "gesture_categories": [
+    {"id": 1, "name": "drive"},
+    {"id": 2, "name": "pull"},
+    {"id": 3, "name": "pass"},
+    {"id": 4, "name": "hand_tie"},
+    {"id": 5, "name": "cut"}
+  ],
+  "sam2": {
+    "model_cfg": "",
+    "checkpoint": "",
+    "device": "auto"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "object_categories": [
+    {"id": 1, "name": "left_hand"},
+    {"id": 2, "name": "right_hand"},
+    {"id": 3, "name": "object"}
+  ],
+  "gesture_categories": [
+    {"id": 1, "name": "reach"},
+    {"id": 2, "name": "grasp"},
+    {"id": 3, "name": "release"},
+    {"id": 4, "name": "idle"}
+  ],
+  "sam2": {
+    "model_cfg": "",
+    "checkpoint": "",
+    "device": "auto"
+  }
+}

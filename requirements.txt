@@ -1,0 +1,8 @@
+opencv-python
+numpy
+imageio-ffmpeg
+
+# Optional SAM2 support:
+# Install PyTorch/TorchVision for your platform, then install SAM2 from Meta:
+#   pip install torch torchvision
+#   pip install git+https://github.com/facebookresearch/sam2.git
