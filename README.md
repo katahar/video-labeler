@@ -27,14 +27,19 @@ py -m venv .venv
 pip install -r requirements.txt
 ```
 
-Optional SAM2 support requires PyTorch/TorchVision and Meta's SAM2 package. Install the PyTorch build that matches your machine, then install SAM2:
+SAM2 is installed automatically into the active Python environment the first time
+`P` is used. The app uses Meta's SAM 2.1 tiny pretrained model by default and
+downloads its weights on first use. For GPU use, installing the matching PyTorch
+build in advance is still recommended:
 
 ```bash
 pip install torch torchvision
 pip install git+https://github.com/facebookresearch/sam2.git
 ```
 
-SAM2 currently expects a model config and checkpoint. Put those paths in your label config under `sam2.model_cfg` and `sam2.checkpoint`. If either is empty or SAM2 cannot be imported, the labeler still runs in manual bounding-box mode.
+Custom model config and checkpoint paths can be set under `sam2.model_cfg` and
+`sam2.checkpoint`. When both are empty, the automatic pretrained model is used.
+If setup fails, the labeler remains usable in manual bounding-box mode.
 
 Platform notes:
 
@@ -114,9 +119,13 @@ Editor:
 - `B`: begin gesture range at current frame
 - `E`: end gesture range at current frame
 - `X`: delete the gesture range containing the current frame
-- `P`: propagate the active track from the current box using SAM2
+- `P`: initialize SAM2 from the active box and propagate it forward; propagated boxes remain draggable for correction, and `P` can be used again from a corrected box
 - `S`: save annotations
-- `Q` or `Esc`: save and return to menu
+- use the on-video dropdowns to select object types, gesture types, tracks, and existing gesture ranges
+- scroll the mouse wheel while a dropdown is open to browse long lists of tracks or gestures
+- after selecting an existing gesture, `B` and `E` move its start and end; selecting a gesture type relabels it
+- `I`: save as in progress and return to the menu (the video remains eligible for `n`)
+- `Q` or `Esc`: save as completed and return to the menu
 
 ## Output Format
 
@@ -129,6 +138,7 @@ example.labels.json
 
 The JSON contains:
 
+- `info.labeling_status`: `in_progress` or `completed`,
 - `video`: video metadata,
 - `images`: one COCO-style image record per frame,
 - `categories`: object categories,

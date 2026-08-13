@@ -9,6 +9,8 @@ datasets. Annotation sidecars are saved beside each video as
 from __future__ import annotations
 
 import json
+import importlib
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -33,6 +35,26 @@ VIDEO_EXTENSIONS = {
 }
 
 BBox = Tuple[int, int, int, int]  # x1, y1, x2, y2 inclusive
+SAM2_REPOSITORY = "git+https://github.com/facebookresearch/sam2.git"
+SAM2_DEFAULT_MODEL = "facebook/sam2-hiera-tiny"
+
+
+def ensure_sam2_installed() -> Tuple[bool, str]:
+    """Install Meta SAM 2 into the active Python environment when needed."""
+    if importlib.util.find_spec("sam2") is not None:
+        return True, ""
+    print("SAM2 is not installed; installing it into the active Python environment...")
+    env = os.environ.copy()
+    env["SAM2_BUILD_CUDA"] = "0"
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", SAM2_REPOSITORY],
+        env=env,
+        check=False,
+    )
+    importlib.invalidate_caches()
+    if result.returncode != 0 or importlib.util.find_spec("sam2") is None:
+        return False, "Automatic SAM2 installation failed; see the terminal output."
+    return True, ""
 
 
 @dataclass
@@ -54,7 +76,7 @@ class LabelConfig:
 class VideoItem:
     input_path: Path
     label_path: Path
-    labeled: bool
+    status: str
 
 
 @dataclass
@@ -85,6 +107,7 @@ class AnnotationState:
     gestures: List[GestureRange] = field(default_factory=list)
     next_track_id: int = 1
     next_gesture_id: int = 1
+    status: str = "in_progress"
 
     def track_by_id(self, track_id: int) -> Optional[ObjectTrack]:
         for track in self.tracks:
@@ -124,12 +147,12 @@ class Sam2Helper:
         self._try_init()
 
     def _try_init(self) -> None:
-        if not self.config.sam2_model_cfg or not self.config.sam2_checkpoint:
-            self.error = "SAM2 config/checkpoint not set."
+        installed, install_error = ensure_sam2_installed()
+        if not installed:
+            self.error = install_error
             return
         try:
             import torch
-            from sam2.build_sam import build_sam2_video_predictor
         except Exception as exc:
             self.error = f"SAM2 not importable: {exc}"
             return
@@ -138,11 +161,20 @@ class Sam2Helper:
             if self.device == "auto":
                 self.device = "cuda" if torch.cuda.is_available() else "cpu"
             sam2_input = prepare_sam2_frame_dir(self.video_path, self.frame_count)
-            self.predictor = build_sam2_video_predictor(
-                self.config.sam2_model_cfg,
-                self.config.sam2_checkpoint,
-                device=self.device,
-            )
+            if self.config.sam2_model_cfg and self.config.sam2_checkpoint:
+                from sam2.build_sam import build_sam2_video_predictor
+                self.predictor = build_sam2_video_predictor(
+                    self.config.sam2_model_cfg,
+                    self.config.sam2_checkpoint,
+                    device=self.device,
+                )
+            else:
+                from sam2.sam2_video_predictor import SAM2VideoPredictor
+                print(f"Downloading/loading default SAM2 model {SAM2_DEFAULT_MODEL}...")
+                self.predictor = SAM2VideoPredictor.from_pretrained(
+                    SAM2_DEFAULT_MODEL,
+                    device=self.device,
+                )
             self.state = self.predictor.init_state(str(sam2_input))
             self.available = True
         except Exception as exc:
@@ -321,7 +353,21 @@ def label_path_for(video_path: Path) -> Path:
 
 def collect_videos(input_dir: Path) -> List[VideoItem]:
     videos = sorted([p for p in input_dir.iterdir() if is_video_file(p)], key=lambda p: p.name.lower())
-    return [VideoItem(v, label_path_for(v), label_path_for(v).exists()) for v in videos]
+    items = []
+    for video_path in videos:
+        label_path = label_path_for(video_path)
+        status = "pending"
+        if label_path.is_file():
+            status = "completed"
+            try:
+                with label_path.open("r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                if payload.get("info", {}).get("labeling_status") == "in_progress":
+                    status = "in_progress"
+            except (OSError, json.JSONDecodeError, AttributeError):
+                pass
+        items.append(VideoItem(video_path, label_path, status))
+    return items
 
 
 def clamp(val: int, low: int, high: int) -> int:
@@ -561,6 +607,7 @@ def serialize_annotations(state: AnnotationState) -> Dict:
             "description": "Video object and gesture labels",
             "version": "1.0",
             "created_by": "video_labeler.py",
+            "labeling_status": state.status,
         },
         "video": {
             "file_name": state.video_path.name,
@@ -625,6 +672,9 @@ def load_annotations(
 
     with label_path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
+
+    info = payload.get("info", {})
+    state.status = "in_progress" if isinstance(info, dict) and info.get("labeling_status") == "in_progress" else "completed"
 
     tracks_payload = payload.get("tracks", [])
     if isinstance(tracks_payload, list):
@@ -726,6 +776,14 @@ class VideoLabelEditor:
         self.move_preview: Optional[BBox] = None
         self.wheel_accum = 0
         self.gesture_start: Optional[int] = None
+        self.selected_gesture_id: Optional[int] = None
+        self.open_menu: Optional[str] = None
+        self.menu_scroll = {
+            "object": 0,
+            "gesture_category": 0,
+            "track": 0,
+            "gesture": 0,
+        }
         self.message = ""
         self.message_until = 0.0
         self.dirty = False
@@ -796,6 +854,9 @@ class VideoLabelEditor:
             delta = self._wheel_delta(flags)
             if delta == 0:
                 return
+            if self.open_menu is not None:
+                self._scroll_open_menu(-1 if delta > 0 else 1)
+                return
             self.wheel_accum += delta
             step_count = 0
             while self.wheel_accum >= 120:
@@ -810,6 +871,8 @@ class VideoLabelEditor:
             return
 
         if event == cv2.EVENT_LBUTTONDOWN:
+            if self._handle_menu_click(x, y):
+                return
             track = self._find_track_at(x, y)
             if track is not None:
                 rect = track.boxes[self.frame_idx]
@@ -869,6 +932,90 @@ class VideoLabelEditor:
                         self.active_track_id = self.state.tracks[0].id if self.state.tracks else None
                 self.dirty = True
 
+    def _selected_gesture(self) -> Optional[GestureRange]:
+        for gesture in self.state.gestures:
+            if gesture.id == self.selected_gesture_id:
+                return gesture
+        return None
+
+    def _menu_definitions(self):
+        tracks = [("New track", None)] + [
+            (f"T{track.id}: {category_name(self.config.object_categories, track.category_id)}", track.id)
+            for track in self.state.tracks
+        ]
+        gestures = [("New gesture", None)] + [
+            (f"G{g.id}: {category_name(self.config.gesture_categories, g.category_id)} "
+             f"[{min(g.start_frame, g.end_frame) + 1}-{max(g.start_frame, g.end_frame) + 1}]", g.id)
+            for g in self.state.gestures
+        ]
+        return {
+            "object": (10, 34, 190, [(cat.name, i) for i, cat in enumerate(self.config.object_categories)]),
+            "gesture_category": (205, 34, 190, [(cat.name, i) for i, cat in enumerate(self.config.gesture_categories)]),
+            "track": (400, 34, 190, tracks),
+            "gesture": (595, 34, 300, gestures),
+        }
+
+    def _handle_menu_click(self, x: int, y: int) -> bool:
+        menus = self._menu_definitions()
+        if self.open_menu is not None:
+            mx, my, mw, options = menus[self.open_menu]
+            offset, visible = self._menu_window(self.open_menu, options, my)
+            if mx <= x < mx + mw and my + 24 <= y < my + 24 * (visible + 1):
+                index = offset + (y - my - 24) // 24
+                self._select_menu_option(self.open_menu, options[index][1])
+                self.open_menu = None
+                return True
+        for name, (mx, my, mw, _options) in menus.items():
+            if mx <= x < mx + mw and my <= y < my + 24:
+                self.open_menu = None if self.open_menu == name else name
+                return True
+        if self.open_menu is not None:
+            self.open_menu = None
+            return True
+        return False
+
+    def _menu_window(self, name: str, options, menu_y: int) -> Tuple[int, int]:
+        # Keep lists compact and above the bottom help text, even on tall videos.
+        visible = min(len(options), max(1, min(20, (self.height - menu_y - 72) // 24)))
+        max_offset = max(0, len(options) - visible)
+        offset = clamp(self.menu_scroll.get(name, 0), 0, max_offset)
+        self.menu_scroll[name] = offset
+        return offset, visible
+
+    def _scroll_open_menu(self, direction: int) -> None:
+        if self.open_menu is None:
+            return
+        _x, menu_y, _width, options = self._menu_definitions()[self.open_menu]
+        offset, visible = self._menu_window(self.open_menu, options, menu_y)
+        max_offset = max(0, len(options) - visible)
+        self.menu_scroll[self.open_menu] = clamp(offset + direction * 3, 0, max_offset)
+
+    def _select_menu_option(self, menu: str, value) -> None:
+        if menu == "object":
+            self.object_category_idx = value
+            track = self.state.track_by_id(self.active_track_id) if self.active_track_id is not None else None
+            if track is not None:
+                track.category_id = self._current_object_category_id()
+                self.dirty = True
+        elif menu == "gesture_category":
+            self.gesture_category_idx = value
+            gesture = self._selected_gesture()
+            if gesture is not None:
+                gesture.category_id = self._current_gesture_category_id()
+                self.dirty = True
+        elif menu == "track":
+            self.active_track_id = value
+            track = self.state.track_by_id(value) if value is not None else None
+            if track is not None:
+                self.object_category_idx = self._category_index(self.config.object_categories, track.category_id)
+        elif menu == "gesture":
+            self.selected_gesture_id = value
+            gesture = self._selected_gesture()
+            if gesture is not None:
+                self.gesture_category_idx = self._category_index(self.config.gesture_categories, gesture.category_id)
+                self.playing = False
+                self.seek(min(gesture.start_frame, gesture.end_frame))
+
     def _category_index(self, categories: List[Category], cat_id: int) -> int:
         for idx, cat in enumerate(categories):
             if cat.id == cat_id:
@@ -921,28 +1068,50 @@ class VideoLabelEditor:
             end = max(gesture.start_frame, gesture.end_frame)
             if start <= self.frame_idx <= end:
                 text = f"Gesture: {category_name(self.config.gesture_categories, gesture.category_id)} [{start + 1}-{end + 1}]"
+                if gesture.id == self.selected_gesture_id:
+                    text += " (selected)"
                 cv2.putText(frame, text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (80, 255, 80), 2)
                 break
 
         status = "PLAY" if self.playing else "PAUSE"
         dirty = "*" if self.dirty else ""
-        active_track = self.active_track_id if self.active_track_id is not None else "new"
         txt1 = (
             f"Frame {self.frame_idx + 1}/{max(self.frame_count, 1)} | {status} | "
             f"speed {self.speed_levels[self.speed_idx]}x | {dirty}{self.label_path.name}"
         )
-        txt2 = (
-            f"Obj {category_name(self.config.object_categories, self._current_object_category_id())} | "
-            f"Track {active_track} | Gesture {category_name(self.config.gesture_categories, self._current_gesture_category_id())}"
-        )
-        txt3 = "Drag=Draw/Move  RightClick=DeleteBox  N=NewTrack  T=NextTrack  O=Object  G=Gesture  B/E=GestureRange"
-        txt4 = "Scroll/Arrows/J/L=Scrub  A/D=-/+10  [/]=- /+100  Space=Play  P=SAM2 Prop  S=Save  Q=Save+Back"
         cv2.putText(frame, txt1, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-        cv2.putText(frame, txt2, (10, self.height - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
+        self._draw_menus(frame)
+        txt3 = "Drag=Draw/Move  RightClick=Delete  B/E=Set gesture bounds  X=Delete gesture"
+        txt4 = "Scroll/Arrows/J/L=Scrub  P=Init/Propagate SAM2  S=Save  I=InProgress  Q=Complete"
         cv2.putText(frame, txt3, (10, self.height - 38), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
         cv2.putText(frame, txt4, (10, self.height - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
         if self.message and time.time() < self.message_until:
             cv2.putText(frame, self.message[:90], (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 255), 2)
+
+    def _draw_menus(self, frame) -> None:
+        selected = self._selected_gesture()
+        labels = {
+            "object": f"Object: {category_name(self.config.object_categories, self._current_object_category_id())}",
+            "gesture_category": f"Type: {category_name(self.config.gesture_categories, self._current_gesture_category_id())}",
+            "track": f"Track: {self.active_track_id if self.active_track_id is not None else 'new'}",
+            "gesture": f"Gesture: {selected.id if selected is not None else 'new'}",
+        }
+        for name, (x, y, width, options) in self._menu_definitions().items():
+            header = labels[name]
+            if self.open_menu == name:
+                offset, visible = self._menu_window(name, options, y)
+                if len(options) > visible:
+                    header += f" [{offset + 1}-{offset + visible}/{len(options)}]"
+            cv2.rectangle(frame, (x, y), (x + width, y + 23), (55, 55, 55), -1)
+            cv2.rectangle(frame, (x, y), (x + width, y + 23), (210, 210, 210), 1)
+            cv2.putText(frame, header[:36], (x + 5, y + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (255, 255, 255), 1)
+            cv2.putText(frame, "v", (x + width - 15, y + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            if self.open_menu == name:
+                for i, (label, _value) in enumerate(options[offset:offset + visible]):
+                    option_y = y + 24 * (i + 1)
+                    cv2.rectangle(frame, (x, option_y), (x + width, option_y + 23), (35, 35, 35), -1)
+                    cv2.rectangle(frame, (x, option_y), (x + width, option_y + 23), (160, 160, 160), 1)
+                    cv2.putText(frame, label[:42], (x + 5, option_y + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
     def _cycle_object_category(self) -> None:
         self.object_category_idx = (self.object_category_idx + 1) % len(self.config.object_categories)
@@ -973,10 +1142,22 @@ class VideoLabelEditor:
             self.object_category_idx = self._category_index(self.config.object_categories, track.category_id)
 
     def _begin_gesture(self) -> None:
+        selected = self._selected_gesture()
+        if selected is not None:
+            selected.start_frame = self.frame_idx
+            self.dirty = True
+            self.set_message(f"Gesture {selected.id} start moved to frame {self.frame_idx + 1}.")
+            return
         self.gesture_start = self.frame_idx
         self.set_message(f"Gesture start set at frame {self.frame_idx + 1}.")
 
     def _end_gesture(self) -> None:
+        selected = self._selected_gesture()
+        if selected is not None:
+            selected.end_frame = self.frame_idx
+            self.dirty = True
+            self.set_message(f"Gesture {selected.id} end moved to frame {self.frame_idx + 1}.")
+            return
         if self.gesture_start is None:
             self.set_message("Set gesture start with B first.")
             return
@@ -988,11 +1169,19 @@ class VideoLabelEditor:
         )
         self.state.next_gesture_id += 1
         self.state.gestures.append(gesture)
+        self.selected_gesture_id = gesture.id
         self.gesture_start = None
         self.dirty = True
         self.set_message("Gesture range added.")
 
     def _delete_current_gesture(self) -> None:
+        selected = self._selected_gesture()
+        if selected is not None:
+            self.state.gestures.remove(selected)
+            self.selected_gesture_id = None
+            self.dirty = True
+            self.set_message("Selected gesture deleted.")
+            return
         for idx in range(len(self.state.gestures) - 1, -1, -1):
             gesture = self.state.gestures[idx]
             start = min(gesture.start_frame, gesture.end_frame)
@@ -1004,7 +1193,9 @@ class VideoLabelEditor:
                 return
         self.set_message("No gesture range on this frame.")
 
-    def _save(self) -> None:
+    def _save(self, status: Optional[str] = None) -> None:
+        if status is not None:
+            self.state.status = status
         save_annotations(self.state)
         self.dirty = False
         self.set_message(f"Saved {self.label_path.name}.")
@@ -1018,7 +1209,7 @@ class VideoLabelEditor:
             self.set_message("Active track needs a box on this frame.")
             return
         if self.sam2 is None:
-            self.set_message("Initializing SAM2...")
+            self.set_message("Initializing SAM2 (first use may install/download it)...", seconds=5.0)
             self.sam2 = Sam2Helper(self.config, self.read_path, self.frame_count)
         if not self.sam2.available:
             self.set_message(self.sam2.error or "SAM2 unavailable.", seconds=4.0)
@@ -1036,7 +1227,7 @@ class VideoLabelEditor:
             return
         track.boxes.update(boxes)
         self.dirty = True
-        self.set_message(f"SAM2 propagated {len(boxes)} frame boxes.")
+        self.set_message(f"SAM2 propagated {len(boxes)} boxes. Drag any box to correct it.", seconds=4.0)
 
     def run(self) -> str:
         if self.frame_count <= 0:
@@ -1062,8 +1253,10 @@ class VideoLabelEditor:
                 if key == -1:
                     continue
                 if key_low in (ord("q"), 27):
-                    if self.dirty:
-                        self._save()
+                    self._save("completed")
+                    break
+                if key_low == ord("i"):
+                    self._save("in_progress")
                     break
                 if key_low == ord(" "):
                     self.playing = not self.playing
@@ -1123,7 +1316,7 @@ def print_menu(items: List[VideoItem], input_dir: Path, config_path: Path) -> No
         print("Idx  Status   Video")
         print("---  -------  ------------------------------")
         for i, item in enumerate(items, start=1):
-            status = "LABELED" if item.labeled else "PENDING"
+            status = {"completed": "LABELED", "in_progress": "IN PROG"}.get(item.status, "PENDING")
             print(f"{i:>3}  {status:<7}  {item.input_path.name}")
     print()
     print("Commands:")
@@ -1196,7 +1389,7 @@ def main() -> int:
                 time.sleep(1.5)
             continue
         if cmd == "n":
-            pending = [idx for idx, item in enumerate(items) if not item.labeled]
+            pending = [idx for idx, item in enumerate(items) if item.status != "completed"]
             if not pending:
                 print("All videos are labeled.")
                 time.sleep(1)
