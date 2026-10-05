@@ -2139,13 +2139,18 @@ class VideoLabelEditor:
         )
         self.state.next_gesture_id += 1
         self.state.gestures.append(gesture)
-        self.selected_gesture_id = gesture.id
+        self.selected_gesture_id = None
         self.gesture_start = None
         self.dirty = True
         self._refresh_gestures()
+        selected_items = self.gesture_tree.selection()
+        if selected_items:
+            self.gesture_tree.selection_remove(*selected_items)
         self._update_label_indicators()
         self.render_frame()
-        self.set_message("Gesture added.")
+        self.set_message(
+            f"Gesture G{gesture.id} added. No label is selected; press B to start another."
+        )
 
     def delete_gesture(self) -> None:
         gesture = self._selected_gesture()
