@@ -1,6 +1,6 @@
 # Video Labeler
 
-Desktop labeling tool for video gesture-classification datasets. It labels:
+Tkinter desktop labeling tool for video gesture-classification datasets. It labels:
 
 - object bounding boxes with stable track IDs,
 - gesture frame ranges,
@@ -105,24 +105,25 @@ Menu:
 
 Editor:
 
+- native Tkinter toolbar, comboboxes, timeline, buttons, and scrollable gesture table
+- **Rotate preview 90°** rotates only the displayed video; repeated clicks cycle through 0°, 90°, 180°, and 270° without modifying the source video or saved annotation coordinates
 - mouse drag: draw a box, or move an existing box
 - right click: delete the box on the current frame
-- scroll, arrows, `J`, `L`: scrub by one frame
+- mouse wheel over the video, arrows, `J`, `L`: scrub by one frame
 - `A`, `D`: scrub by 10 frames
-- `[`, `]`: scrub by 100 frames
 - space: play/pause
-- `1`..`9`: playback speed
 - `N`: next drawn box starts a new object track
-- `T`: cycle active object track
-- `O`: cycle object category
-- `G`: cycle gesture category
 - `B`: begin gesture range at current frame
 - `E`: end gesture range at current frame
-- `X`: delete the gesture range containing the current frame
+- `X`: delete the selected gesture
 - `P`: initialize SAM2 from the active box and propagate it forward; propagated boxes remain draggable for correction, and `P` can be used again from a corrected box
 - `S`: save annotations
-- use the on-video dropdowns to select object types, gesture types, tracks, and existing gesture ranges
-- scroll the mouse wheel while a dropdown is open to browse long lists of tracks or gestures
+- use the toolbar comboboxes to select object types, gesture types, and tracks
+- use the scrollable gesture table to browse and edit any number of labeled gestures
+- gesture table rows size themselves from the active Tk font so values remain readable with display scaling and larger system fonts
+- select an existing gesture and click **Review window** (or double-click it) to constrain the timeline and playback to that instance's exact start/end frames
+- use **Previous** and **Next** to move between labeled instances; while reviewing, the next selected instance immediately becomes the active review window
+- playback stops at the selected instance's end; clicking **Exit review** restores the full-video timeline
 - after selecting an existing gesture, `B` and `E` move its start and end; selecting a gesture type relabels it
 - `I`: save as in progress and return to the menu (the video remains eligible for `n`)
 - `Q` or `Esc`: save as completed and return to the menu

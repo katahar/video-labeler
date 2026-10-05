@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import importlib
 import importlib.util
+import base64
 import os
 import shutil
 import subprocess
@@ -726,7 +727,7 @@ def load_annotations(
     return state
 
 
-class VideoLabelEditor:
+class _LegacyOpenCVVideoLabelEditor:
     def __init__(self, input_path: Path, config: LabelConfig) -> None:
         self.input_path = input_path
         self.config = config
@@ -1302,6 +1303,700 @@ class VideoLabelEditor:
         finally:
             self.close()
         return "saved" if self.label_path.exists() else ""
+
+
+class VideoLabelEditor:
+    """Tkinter video annotation editor; OpenCV is used only for frame decoding."""
+
+    def __init__(self, input_path: Path, config: LabelConfig) -> None:
+        import tkinter as tk
+        import tkinter.font as tkfont
+        from tkinter import ttk
+
+        self.tk = tk
+        self.tkfont = tkfont
+        self.ttk = ttk
+        self.input_path = input_path
+        self.config = config
+        self.label_path = label_path_for(input_path)
+        cache_dir = input_path.parent / ".video_labeler_import_cache"
+        self.read_path = ensure_readable_input(input_path, cache_dir)
+        self.cap = cv2.VideoCapture(str(self.read_path))
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Failed to open video: {input_path}")
+        self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.state = load_annotations(
+            input_path, self.label_path, self.width, self.height,
+            self.frame_count, self.fps, config,
+        )
+
+        self.frame_idx = 0
+        self.playing = False
+        self.play_after_id = None
+        self.active_track_id = self.state.tracks[0].id if self.state.tracks else None
+        self.selected_gesture_id = None
+        self.review_gesture_id = None
+        self.gesture_start = None
+        self.dirty = False
+        self.result = ""
+        self.sam2 = None
+        self.photo = None
+        self.preview_rotation = 0
+        self.canvas_scale = 1.0
+        self.canvas_offset = (0, 0)
+        self.drag_mode = None
+        self.drag_start = (0, 0)
+        self.drag_track = None
+        self.drag_offset = (0, 0)
+        self.drag_size = (0, 0)
+
+        self.root = tk.Tk()
+        self.root.title(f"Video Labeler — {input_path.name}")
+        self.root.geometry("1280x850")
+        self.root.minsize(900, 650)
+        self.root.protocol("WM_DELETE_WINDOW", self.finish)
+        self._build_ui()
+        self._bind_keys()
+        self._refresh_all()
+
+    def _build_ui(self) -> None:
+        tk, ttk = self.tk, self.ttk
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)
+
+        toolbar = ttk.Frame(self.root, padding=8)
+        toolbar.grid(row=0, column=0, sticky="ew")
+        for col in range(9):
+            toolbar.columnconfigure(col, weight=1 if col in (1, 3, 5) else 0)
+
+        ttk.Label(toolbar, text="Object").grid(row=0, column=0, sticky="w")
+        self.object_var = tk.StringVar()
+        self.object_combo = ttk.Combobox(
+            toolbar, textvariable=self.object_var, state="readonly",
+            values=[c.name for c in self.config.object_categories],
+        )
+        self.object_combo.grid(row=0, column=1, sticky="ew", padx=(4, 12))
+        self.object_combo.bind("<<ComboboxSelected>>", self._object_changed)
+
+        ttk.Label(toolbar, text="Track").grid(row=0, column=2, sticky="w")
+        self.track_var = tk.StringVar()
+        self.track_combo = ttk.Combobox(toolbar, textvariable=self.track_var, state="readonly")
+        self.track_combo.grid(row=0, column=3, sticky="ew", padx=(4, 12))
+        self.track_combo.bind("<<ComboboxSelected>>", self._track_changed)
+
+        ttk.Label(toolbar, text="Gesture type").grid(row=0, column=4, sticky="w")
+        self.gesture_type_var = tk.StringVar()
+        self.gesture_type_combo = ttk.Combobox(
+            toolbar, textvariable=self.gesture_type_var, state="readonly",
+            values=[c.name for c in self.config.gesture_categories],
+        )
+        self.gesture_type_combo.grid(row=0, column=5, sticky="ew", padx=(4, 12))
+        self.gesture_type_combo.bind("<<ComboboxSelected>>", self._gesture_type_changed)
+
+        ttk.Button(toolbar, text="New track", command=self.new_track).grid(row=0, column=6, padx=3)
+        ttk.Button(toolbar, text="SAM2 propagate", command=self.sam2_propagate).grid(row=0, column=7, padx=3)
+        self.rotate_button = ttk.Button(toolbar, text="Rotate preview 90°", command=self.rotate_preview)
+        self.rotate_button.grid(row=0, column=8, padx=3)
+
+        body = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
+        body.grid(row=1, column=0, sticky="nsew", padx=8)
+        video_panel = ttk.Frame(body)
+        side = ttk.Frame(body, width=340)
+        body.add(video_panel, weight=4)
+        body.add(side, weight=1)
+        video_panel.rowconfigure(0, weight=1)
+        video_panel.columnconfigure(0, weight=1)
+
+        self.canvas = tk.Canvas(video_panel, background="#151515", highlightthickness=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.canvas.bind("<Configure>", lambda _e: self.render_frame())
+        self.canvas.bind("<ButtonPress-1>", self._mouse_down)
+        self.canvas.bind("<B1-Motion>", self._mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._mouse_up)
+        self.canvas.bind("<Button-3>", self._delete_box_at)
+        self.canvas.bind("<MouseWheel>", self._wheel)
+        self.canvas.bind("<Button-4>", lambda _e: self.step(-1))
+        self.canvas.bind("<Button-5>", lambda _e: self.step(1))
+
+        side.columnconfigure(0, weight=1)
+        side.rowconfigure(2, weight=1)
+        ttk.Label(side, text="Gestures", font=("", 11, "bold")).grid(row=0, column=0, sticky="w", pady=(4, 6))
+        gesture_buttons = ttk.Frame(side)
+        gesture_buttons.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        for col in range(6):
+            gesture_buttons.columnconfigure(col, weight=1)
+        ttk.Button(gesture_buttons, text="Start (B)", command=self.begin_gesture).grid(row=0, column=0, sticky="ew")
+        ttk.Button(gesture_buttons, text="End (E)", command=self.end_gesture).grid(row=0, column=1, sticky="ew")
+        ttk.Button(gesture_buttons, text="Previous", command=lambda: self.select_adjacent_gesture(-1)).grid(row=0, column=2, sticky="ew")
+        ttk.Button(gesture_buttons, text="Next", command=lambda: self.select_adjacent_gesture(1)).grid(row=0, column=3, sticky="ew")
+        self.review_button = ttk.Button(gesture_buttons, text="Review window", command=self.toggle_review)
+        self.review_button.grid(row=0, column=4, sticky="ew")
+        ttk.Button(gesture_buttons, text="Delete", command=self.delete_gesture).grid(row=0, column=5, sticky="ew")
+
+        gesture_frame = ttk.Frame(side)
+        gesture_frame.grid(row=2, column=0, sticky="nsew")
+        gesture_frame.rowconfigure(0, weight=1)
+        gesture_frame.columnconfigure(0, weight=1)
+        default_font = self.tkfont.nametofont("TkDefaultFont", root=self.root)
+        heading_font = self.tkfont.nametofont("TkHeadingFont", root=self.root)
+        row_height = max(30, default_font.metrics("linespace") + 12)
+        tree_style = ttk.Style(self.root)
+        tree_style.configure(
+            "Gesture.Treeview",
+            font=default_font,
+            rowheight=row_height,
+        )
+        tree_style.configure(
+            "Gesture.Treeview.Heading",
+            font=heading_font,
+            padding=(6, 7),
+        )
+        self.gesture_tree = ttk.Treeview(
+            gesture_frame, columns=("type", "start", "end"), show="headings",
+            selectmode="browse", style="Gesture.Treeview",
+        )
+        self.gesture_tree.heading("type", text="Type")
+        self.gesture_tree.heading("start", text="Start")
+        self.gesture_tree.heading("end", text="End")
+        self.gesture_tree.column("type", width=150, stretch=True)
+        self.gesture_tree.column("start", width=60, anchor="e")
+        self.gesture_tree.column("end", width=60, anchor="e")
+        scrollbar = ttk.Scrollbar(gesture_frame, orient="vertical", command=self.gesture_tree.yview)
+        self.gesture_tree.configure(yscrollcommand=scrollbar.set)
+        self.gesture_tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.gesture_tree.bind("<<TreeviewSelect>>", self._gesture_selected)
+        self.gesture_tree.bind("<Double-1>", lambda _e: self.start_review())
+
+        transport = ttk.Frame(self.root, padding=(8, 6))
+        transport.grid(row=2, column=0, sticky="ew")
+        transport.columnconfigure(4, weight=1)
+        ttk.Button(transport, text="⏮ 100", command=lambda: self.step(-100)).grid(row=0, column=0)
+        ttk.Button(transport, text="◀", command=lambda: self.step(-1)).grid(row=0, column=1)
+        self.play_button = ttk.Button(transport, text="▶ Play", command=self.toggle_play)
+        self.play_button.grid(row=0, column=2)
+        ttk.Button(transport, text="▶", command=lambda: self.step(1)).grid(row=0, column=3)
+        self.frame_var = tk.DoubleVar(value=0)
+        self.frame_scale = ttk.Scale(
+            transport, from_=0, to=max(0, self.frame_count - 1),
+            variable=self.frame_var, command=self._slider_changed,
+        )
+        self.frame_scale.grid(row=0, column=4, sticky="ew", padx=10)
+        ttk.Button(transport, text="100 ⏭", command=lambda: self.step(100)).grid(row=0, column=5)
+        self.frame_label = ttk.Label(transport, width=18, anchor="e")
+        self.frame_label.grid(row=0, column=6, padx=(10, 0))
+
+        footer = ttk.Frame(self.root, padding=(8, 0, 8, 8))
+        footer.grid(row=3, column=0, sticky="ew")
+        footer.columnconfigure(0, weight=1)
+        self.status_var = tk.StringVar(value="Ready")
+        ttk.Label(footer, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
+        ttk.Button(footer, text="Save", command=self.save).grid(row=0, column=1, padx=3)
+        ttk.Button(footer, text="Save in progress", command=self.save_in_progress).grid(row=0, column=2, padx=3)
+        ttk.Button(footer, text="Finish", command=self.finish).grid(row=0, column=3, padx=3)
+
+    def _bind_keys(self) -> None:
+        bindings = {
+            "<space>": self.toggle_play, "<Left>": lambda: self.step(-1),
+            "<Right>": lambda: self.step(1), "j": lambda: self.step(-1),
+            "l": lambda: self.step(1), "a": lambda: self.step(-10),
+            "d": lambda: self.step(10), "b": self.begin_gesture,
+            "e": self.end_gesture, "x": self.delete_gesture,
+            "n": self.new_track, "p": self.sam2_propagate, "s": self.save,
+            "i": self.save_in_progress, "q": self.finish,
+            "<Escape>": self.finish,
+            "r": self.toggle_review,
+        }
+        for key, callback in bindings.items():
+            self.root.bind(key, lambda _event, fn=callback: fn())
+
+    def set_message(self, text: str) -> None:
+        self.status_var.set(text)
+        print(text)
+
+    def _category_index(self, categories: List[Category], category_id: int) -> int:
+        return next((i for i, c in enumerate(categories) if c.id == category_id), 0)
+
+    def _selected_gesture(self) -> Optional[GestureRange]:
+        return next((g for g in self.state.gestures if g.id == self.selected_gesture_id), None)
+
+    def _review_gesture(self) -> Optional[GestureRange]:
+        return next((g for g in self.state.gestures if g.id == self.review_gesture_id), None)
+
+    def _playback_bounds(self) -> Tuple[int, int]:
+        gesture = self._review_gesture()
+        if gesture is None:
+            return 0, max(0, self.frame_count - 1)
+        return (
+            min(gesture.start_frame, gesture.end_frame),
+            max(gesture.start_frame, gesture.end_frame),
+        )
+
+    def _update_frame_label(self) -> None:
+        start, end = self._playback_bounds()
+        if self.review_gesture_id is None:
+            text = f"Frame {self.frame_idx + 1} / {max(1, self.frame_count)}"
+        else:
+            text = (
+                f"Frame {self.frame_idx + 1}  •  "
+                f"window {start + 1}–{end + 1}"
+            )
+        self.frame_label.configure(text=text)
+
+    def _tracks_on_frame(self):
+        return [(t, t.boxes[self.frame_idx]) for t in self.state.tracks if self.frame_idx in t.boxes]
+
+    def _refresh_all(self) -> None:
+        self._refresh_tracks()
+        self._refresh_gestures()
+        self._sync_controls()
+        self.render_frame()
+
+    def _refresh_tracks(self) -> None:
+        values = ["New track"] + [
+            f"T{t.id}: {category_name(self.config.object_categories, t.category_id)}"
+            for t in self.state.tracks
+        ]
+        self.track_combo["values"] = values
+        if self.active_track_id is None:
+            self.track_combo.current(0)
+        else:
+            ids = [t.id for t in self.state.tracks]
+            self.track_combo.current(ids.index(self.active_track_id) + 1 if self.active_track_id in ids else 0)
+
+    def _refresh_gestures(self) -> None:
+        selected = str(self.selected_gesture_id) if self.selected_gesture_id is not None else ""
+        for item in self.gesture_tree.get_children():
+            self.gesture_tree.delete(item)
+        for gesture in self.state.gestures:
+            self.gesture_tree.insert(
+                "", "end", iid=str(gesture.id),
+                values=(
+                    category_name(self.config.gesture_categories, gesture.category_id),
+                    min(gesture.start_frame, gesture.end_frame) + 1,
+                    max(gesture.start_frame, gesture.end_frame) + 1,
+                ),
+            )
+        if selected and self.gesture_tree.exists(selected):
+            self.gesture_tree.selection_set(selected)
+            self.gesture_tree.see(selected)
+
+    def _sync_controls(self) -> None:
+        track = self.state.track_by_id(self.active_track_id) if self.active_track_id else None
+        object_id = track.category_id if track else self.config.object_categories[0].id
+        self.object_combo.current(self._category_index(self.config.object_categories, object_id))
+        gesture = self._selected_gesture()
+        gesture_id = gesture.category_id if gesture else self.config.gesture_categories[0].id
+        self.gesture_type_combo.current(self._category_index(self.config.gesture_categories, gesture_id))
+        self.frame_var.set(self.frame_idx)
+        self._update_frame_label()
+
+    def _object_changed(self, _event=None) -> None:
+        track = self.state.track_by_id(self.active_track_id) if self.active_track_id else None
+        if track is not None:
+            track.category_id = self.config.object_categories[self.object_combo.current()].id
+            self.dirty = True
+            self._refresh_tracks()
+            self.render_frame()
+
+    def _track_changed(self, _event=None) -> None:
+        index = self.track_combo.current()
+        self.active_track_id = None if index <= 0 else self.state.tracks[index - 1].id
+        self._sync_controls()
+        self.render_frame()
+
+    def _gesture_type_changed(self, _event=None) -> None:
+        gesture = self._selected_gesture()
+        if gesture is not None:
+            gesture.category_id = self.config.gesture_categories[self.gesture_type_combo.current()].id
+            self.dirty = True
+            self._refresh_gestures()
+            self.render_frame()
+
+    def _gesture_selected(self, _event=None) -> None:
+        selection = self.gesture_tree.selection()
+        self.selected_gesture_id = int(selection[0]) if selection else None
+        if self.review_gesture_id is not None and self.selected_gesture_id is not None:
+            self.start_review()
+        self._sync_controls()
+        self.render_frame()
+
+    def goto_gesture(self) -> None:
+        gesture = self._selected_gesture()
+        if gesture is not None:
+            self.seek(min(gesture.start_frame, gesture.end_frame))
+
+    def select_adjacent_gesture(self, direction: int) -> None:
+        gestures = sorted(
+            self.state.gestures,
+            key=lambda gesture: (min(gesture.start_frame, gesture.end_frame), gesture.id),
+        )
+        if not gestures:
+            self.set_message("There are no labeled gesture instances.")
+            return
+        ids = [gesture.id for gesture in gestures]
+        if self.selected_gesture_id in ids:
+            index = (ids.index(self.selected_gesture_id) + direction) % len(ids)
+        else:
+            index = 0 if direction > 0 else len(ids) - 1
+        self.selected_gesture_id = ids[index]
+        iid = str(self.selected_gesture_id)
+        self.gesture_tree.selection_set(iid)
+        self.gesture_tree.focus(iid)
+        self.gesture_tree.see(iid)
+        if self.review_gesture_id is not None:
+            self.start_review()
+        else:
+            self.goto_gesture()
+        self._sync_controls()
+        self.render_frame()
+
+    def start_review(self) -> None:
+        gesture = self._selected_gesture()
+        if gesture is None:
+            self.set_message("Select a labeled gesture instance to review.")
+            return
+        self.playing = False
+        self.play_button.configure(text="▶ Play")
+        self.review_gesture_id = gesture.id
+        start, end = self._playback_bounds()
+        self.frame_scale.configure(from_=start, to=end)
+        self.review_button.configure(text="Exit review")
+        self.seek(start)
+        label = category_name(self.config.gesture_categories, gesture.category_id)
+        self.set_message(
+            f"Reviewing G{gesture.id} ({label}), frames {start + 1}–{end + 1}. "
+            "Playback will stop at the window end."
+        )
+
+    def stop_review(self) -> None:
+        self.playing = False
+        self.play_button.configure(text="▶ Play")
+        self.review_gesture_id = None
+        self.frame_scale.configure(from_=0, to=max(0, self.frame_count - 1))
+        self.review_button.configure(text="Review window")
+        self._update_frame_label()
+        self.set_message("Returned to the full video.")
+
+    def toggle_review(self) -> None:
+        if self.review_gesture_id is None:
+            self.start_review()
+        else:
+            self.stop_review()
+
+    def seek(self, index: int) -> None:
+        start, end = self._playback_bounds()
+        self.frame_idx = clamp(int(index), start, end)
+        self.frame_var.set(self.frame_idx)
+        self._update_frame_label()
+        self.render_frame()
+
+    def step(self, amount: int) -> None:
+        self.playing = False
+        self.play_button.configure(text="▶ Play")
+        self.seek(self.frame_idx + amount)
+
+    def _slider_changed(self, value) -> None:
+        start, end = self._playback_bounds()
+        index = clamp(int(float(value)), start, end)
+        if index != self.frame_idx:
+            self.frame_idx = index
+            self._update_frame_label()
+            self.render_frame()
+
+    def toggle_play(self) -> None:
+        start, end = self._playback_bounds()
+        if not self.playing and self.frame_idx >= end:
+            self.seek(start)
+        self.playing = not self.playing
+        self.play_button.configure(text="⏸ Pause" if self.playing else "▶ Play")
+        if self.playing:
+            self._play_tick()
+
+    def _play_tick(self) -> None:
+        if not self.playing:
+            return
+        _start, end = self._playback_bounds()
+        if self.frame_idx >= end:
+            self.toggle_play()
+            if self.review_gesture_id is not None:
+                gesture = self._review_gesture()
+                self.set_message(
+                    f"Review complete: G{gesture.id}, frames "
+                    f"{min(gesture.start_frame, gesture.end_frame) + 1}–"
+                    f"{max(gesture.start_frame, gesture.end_frame) + 1}."
+                )
+            return
+        self.seek(self.frame_idx + 1)
+        self.play_after_id = self.root.after(max(1, int(1000 / self.fps)), self._play_tick)
+
+    def _video_point(self, canvas_x: int, canvas_y: int) -> Optional[Tuple[int, int]]:
+        ox, oy = self.canvas_offset
+        rotated_x = int((canvas_x - ox) / self.canvas_scale)
+        rotated_y = int((canvas_y - oy) / self.canvas_scale)
+        rotated_width, rotated_height = self._preview_dimensions()
+        if not (0 <= rotated_x < rotated_width and 0 <= rotated_y < rotated_height):
+            return None
+        if self.preview_rotation == 0:
+            x, y = rotated_x, rotated_y
+        elif self.preview_rotation == 90:
+            x, y = rotated_y, self.height - 1 - rotated_x
+        elif self.preview_rotation == 180:
+            x, y = self.width - 1 - rotated_x, self.height - 1 - rotated_y
+        else:
+            x, y = self.width - 1 - rotated_y, rotated_x
+        if 0 <= x < self.width and 0 <= y < self.height:
+            return x, y
+        return None
+
+    def _preview_dimensions(self) -> Tuple[int, int]:
+        if self.preview_rotation in (90, 270):
+            return self.height, self.width
+        return self.width, self.height
+
+    def rotate_preview(self) -> None:
+        self.preview_rotation = (self.preview_rotation + 90) % 360
+        self.rotate_button.configure(text=f"Rotate preview 90°  ({self.preview_rotation}°)")
+        self.render_frame()
+        self.set_message(
+            f"Preview rotated to {self.preview_rotation}°. "
+            "The source video and saved coordinates are unchanged."
+        )
+
+    def _find_track(self, x: int, y: int) -> Optional[ObjectTrack]:
+        for track, rect in reversed(self._tracks_on_frame()):
+            if point_in_rect(x, y, rect):
+                return track
+        return None
+
+    def _mouse_down(self, event) -> None:
+        point = self._video_point(event.x, event.y)
+        if point is None:
+            return
+        x, y = point
+        track = self._find_track(x, y)
+        if track is None:
+            self.drag_mode, self.drag_start = "draw", point
+        else:
+            rect = track.boxes[self.frame_idx]
+            self.active_track_id = track.id
+            self.drag_track = track
+            self.drag_mode = "move"
+            self.drag_offset = (x - rect[0], y - rect[1])
+            self.drag_size = (rect[2] - rect[0], rect[3] - rect[1])
+            self._refresh_tracks()
+            self._sync_controls()
+
+    def _mouse_drag(self, event) -> None:
+        point = self._video_point(event.x, event.y)
+        if point is None or self.drag_mode is None:
+            return
+        x, y = point
+        if self.drag_mode == "draw":
+            self.render_frame(preview=normalize_rect(*self.drag_start, x, y, self.width, self.height))
+        elif self.drag_track is not None:
+            ox, oy = self.drag_offset
+            width, height = self.drag_size
+            rect = normalize_rect(x - ox, y - oy, x - ox + width, y - oy + height, self.width, self.height)
+            self.render_frame(preview=rect)
+
+    def _mouse_up(self, event) -> None:
+        point = self._video_point(event.x, event.y)
+        if point is None or self.drag_mode is None:
+            self.drag_mode = None
+            return
+        x, y = point
+        if self.drag_mode == "draw":
+            rect = normalize_rect(*self.drag_start, x, y, self.width, self.height)
+            if rect[2] - rect[0] >= 2 and rect[3] - rect[1] >= 2:
+                category_id = self.config.object_categories[self.object_combo.current()].id
+                track = self.state.ensure_track(self.active_track_id, category_id)
+                track.boxes[self.frame_idx] = rect
+                self.active_track_id = track.id
+                self.dirty = True
+        elif self.drag_track is not None:
+            ox, oy = self.drag_offset
+            width, height = self.drag_size
+            self.drag_track.boxes[self.frame_idx] = normalize_rect(
+                x - ox, y - oy, x - ox + width, y - oy + height, self.width, self.height,
+            )
+            self.dirty = True
+        self.drag_mode = None
+        self.drag_track = None
+        self._refresh_all()
+
+    def _delete_box_at(self, event) -> None:
+        point = self._video_point(event.x, event.y)
+        track = self._find_track(*point) if point else None
+        if track is None:
+            return
+        track.boxes.pop(self.frame_idx, None)
+        if not track.boxes:
+            self.state.tracks.remove(track)
+            if self.active_track_id == track.id:
+                self.active_track_id = None
+        self.dirty = True
+        self._refresh_all()
+
+    def _wheel(self, event) -> None:
+        self.step(-1 if event.delta > 0 else 1)
+
+    def render_frame(self, preview: Optional[BBox] = None) -> None:
+        if not self.root.winfo_exists() or self.frame_count <= 0:
+            return
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.frame_idx)
+        ok, frame = self.cap.read()
+        if not ok:
+            return
+        for track, rect in self._tracks_on_frame():
+            color = (0, 255, 255) if track.id == self.active_track_id else (0, 180, 255)
+            cv2.rectangle(frame, rect[:2], rect[2:], color, 2)
+            text = f"T{track.id}: {category_name(self.config.object_categories, track.category_id)}"
+            cv2.putText(frame, text, (rect[0], max(16, rect[1] - 5)), cv2.FONT_HERSHEY_SIMPLEX, .48, color, 1)
+        if preview:
+            cv2.rectangle(frame, preview[:2], preview[2:], (0, 255, 0), 2)
+
+        if self.preview_rotation == 90:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif self.preview_rotation == 180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        elif self.preview_rotation == 270:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        canvas_width = max(1, self.canvas.winfo_width())
+        canvas_height = max(1, self.canvas.winfo_height())
+        preview_width, preview_height = self._preview_dimensions()
+        self.canvas_scale = min(canvas_width / preview_width, canvas_height / preview_height)
+        display_size = (
+            max(1, int(preview_width * self.canvas_scale)),
+            max(1, int(preview_height * self.canvas_scale)),
+        )
+        resized = cv2.resize(frame, display_size, interpolation=cv2.INTER_AREA)
+        ok, encoded = cv2.imencode(".png", resized)
+        if not ok:
+            return
+        self.photo = self.tk.PhotoImage(data=base64.b64encode(encoded).decode("ascii"))
+        ox = (canvas_width - display_size[0]) // 2
+        oy = (canvas_height - display_size[1]) // 2
+        self.canvas_offset = (ox, oy)
+        self.canvas.delete("all")
+        self.canvas.create_image(ox, oy, image=self.photo, anchor="nw")
+
+    def new_track(self) -> None:
+        self.active_track_id = None
+        self._refresh_tracks()
+        self.set_message("Draw a box to create a new track.")
+
+    def begin_gesture(self) -> None:
+        gesture = self._selected_gesture()
+        if gesture is not None:
+            gesture.start_frame = self.frame_idx
+            self.dirty = True
+            self._refresh_gestures()
+            if self.review_gesture_id == gesture.id:
+                self.start_review()
+            self.set_message(f"Gesture {gesture.id} start updated.")
+        else:
+            self.gesture_start = self.frame_idx
+            self.set_message(f"Gesture start set to frame {self.frame_idx + 1}.")
+
+    def end_gesture(self) -> None:
+        gesture = self._selected_gesture()
+        if gesture is not None:
+            gesture.end_frame = self.frame_idx
+            self.dirty = True
+            self._refresh_gestures()
+            if self.review_gesture_id == gesture.id:
+                self.start_review()
+            self.set_message(f"Gesture {gesture.id} end updated.")
+            return
+        if self.gesture_start is None:
+            self.set_message("Set a gesture start first.")
+            return
+        category_id = self.config.gesture_categories[self.gesture_type_combo.current()].id
+        gesture = GestureRange(
+            self.state.next_gesture_id, category_id, self.gesture_start, self.frame_idx,
+        )
+        self.state.next_gesture_id += 1
+        self.state.gestures.append(gesture)
+        self.selected_gesture_id = gesture.id
+        self.gesture_start = None
+        self.dirty = True
+        self._refresh_gestures()
+        self.set_message("Gesture added.")
+
+    def delete_gesture(self) -> None:
+        gesture = self._selected_gesture()
+        if gesture is None:
+            self.set_message("Select a gesture to delete.")
+            return
+        self.state.gestures.remove(gesture)
+        if self.review_gesture_id == gesture.id:
+            self.stop_review()
+        self.selected_gesture_id = None
+        self.dirty = True
+        self._refresh_gestures()
+        self.set_message("Gesture deleted.")
+
+    def save(self, status: Optional[str] = None) -> None:
+        if status:
+            self.state.status = status
+        save_annotations(self.state)
+        self.dirty = False
+        self.result = "saved"
+        self.set_message(f"Saved {self.label_path.name}.")
+
+    def save_in_progress(self) -> None:
+        self.save("in_progress")
+        self.close()
+
+    def finish(self) -> None:
+        self.save("completed")
+        self.close()
+
+    def sam2_propagate(self) -> None:
+        track = self.state.track_by_id(self.active_track_id) if self.active_track_id else None
+        if track is None or self.frame_idx not in track.boxes:
+            self.set_message("Select a track with a box on this frame first.")
+            return
+        self.set_message("Initializing/propagating SAM2; the window may pause...")
+        self.root.update_idletasks()
+        if self.sam2 is None:
+            self.sam2 = Sam2Helper(self.config, self.read_path, self.frame_count)
+        if not self.sam2.available:
+            self.set_message(self.sam2.error or "SAM2 unavailable.")
+            return
+        try:
+            boxes = self.sam2.propagate_box(
+                self.frame_idx, track.id, track.boxes[self.frame_idx], self.frame_count - 1,
+            )
+            track.boxes.update(boxes)
+            self.dirty = True
+            self.render_frame()
+            self.set_message(f"SAM2 added {len(boxes)} editable boxes.")
+        except Exception as exc:
+            self.set_message(f"SAM2 propagation failed: {exc}")
+
+    def close(self) -> None:
+        self.playing = False
+        if self.play_after_id is not None:
+            try:
+                self.root.after_cancel(self.play_after_id)
+            except Exception:
+                pass
+        self.cap.release()
+        if self.root.winfo_exists():
+            self.root.destroy()
+
+    def run(self) -> str:
+        if self.frame_count <= 0:
+            self.close()
+            return ""
+        self.root.mainloop()
+        return self.result
 
 
 def print_menu(items: List[VideoItem], input_dir: Path, config_path: Path) -> None:
