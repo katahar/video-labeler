@@ -1337,6 +1337,7 @@ class VideoLabelEditor:
         self.playing = False
         self.play_after_id = None
         self.scrub_after_id = None
+        self.scrub_release_after_id = None
         self.scrub_key = None
         self.scrub_amount = 0
         self.gesture_deselect_after_id = None
@@ -1575,7 +1576,7 @@ class VideoLabelEditor:
             )
             self.root.bind(
                 f"<KeyRelease-{key}>",
-                self._stop_scrub,
+                self._scrub_key_released,
             )
 
     def set_message(self, text: str) -> None:
@@ -1833,6 +1834,7 @@ class VideoLabelEditor:
 
     def _start_scrub(self, event, amount: int) -> None:
         key = event.keysym.lower()
+        self._cancel_scrub_release()
         if self.scrub_key == key:
             return
         self._stop_scrub()
@@ -1849,9 +1851,32 @@ class VideoLabelEditor:
         # accumulating repeated key events when decoding is slower than input.
         self.scrub_after_id = self.root.after(45, self._scrub_tick)
 
-    def _stop_scrub(self, event=None) -> None:
-        if event is not None and self.scrub_key not in (None, event.keysym.lower()):
+    def _cancel_scrub_release(self) -> None:
+        if self.scrub_release_after_id is not None:
+            try:
+                self.root.after_cancel(self.scrub_release_after_id)
+            except Exception:
+                pass
+        self.scrub_release_after_id = None
+
+    def _scrub_key_released(self, event) -> None:
+        key = event.keysym.lower()
+        if self.scrub_key != key:
             return
+        self._cancel_scrub_release()
+        # X11 represents keyboard autorepeat as a synthetic release/press pair.
+        # A paired repeat press cancels this idle callback. A real release does not.
+        self.scrub_release_after_id = self.root.after_idle(
+            lambda released_key=key: self._finish_scrub_release(released_key),
+        )
+
+    def _finish_scrub_release(self, key: str) -> None:
+        self.scrub_release_after_id = None
+        if self.scrub_key == key:
+            self._stop_scrub()
+
+    def _stop_scrub(self) -> None:
+        self._cancel_scrub_release()
         if self.scrub_after_id is not None:
             try:
                 self.root.after_cancel(self.scrub_after_id)

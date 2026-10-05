@@ -114,7 +114,7 @@ Editor:
 - right click: delete the box on the current frame
 - mouse wheel over the video, arrows, `J`, `L`: scrub by one frame
 - `A`, `D`: scrub by 10 frames
-- holding a scrub key runs one coalesced frame loop that stops immediately on key release, without queuing extra frame steps
+- holding a scrub key runs one coalesced frame loop that stops on the real key release; synthetic X11 autorepeat release/press pairs are filtered so frame steps cannot queue
 - space: play/pause
 - `N`: next drawn box starts a new object track
 - `B`: begin gesture range at current frame
