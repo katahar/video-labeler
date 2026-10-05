@@ -114,6 +114,7 @@ Editor:
 - right click: delete the box on the current frame
 - mouse wheel over the video, arrows, `J`, `L`: scrub by one frame
 - `A`, `D`: scrub by 10 frames
+- holding a scrub key runs one coalesced frame loop that stops immediately on key release, without queuing extra frame steps
 - space: play/pause
 - `N`: next drawn box starts a new object track
 - `B`: begin gesture range at current frame
@@ -124,6 +125,8 @@ Editor:
 - `S`: save annotations
 - use the toolbar comboboxes to select object types, gesture types, and tracks
 - use the scrollable gesture table to browse and edit any number of labeled gestures
+- gesture labels in the right panel are sorted chronologically by their start frame
+- click an already selected gesture a second time to deselect it; `B` will then begin a new label instead of editing the existing one
 - gesture table rows size themselves from the active Tk font so values remain readable with display scaling and larger system fonts
 - select an existing gesture and click **Review window** (or double-click it) to constrain the timeline and playback to that instance's exact start/end frames
 - use **Previous** and **Next** to move between labeled instances; while reviewing, the next selected instance immediately becomes the active review window

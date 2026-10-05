@@ -1336,6 +1336,10 @@ class VideoLabelEditor:
         self.frame_idx = 0
         self.playing = False
         self.play_after_id = None
+        self.scrub_after_id = None
+        self.scrub_key = None
+        self.scrub_amount = 0
+        self.gesture_deselect_after_id = None
         self.active_track_id = self.state.tracks[0].id if self.state.tracks else None
         self.selected_gesture_id = None
         self.review_gesture_id = None
@@ -1485,7 +1489,8 @@ class VideoLabelEditor:
         self.gesture_tree.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.gesture_tree.bind("<<TreeviewSelect>>", self._gesture_selected)
-        self.gesture_tree.bind("<Double-1>", lambda _e: self.start_review())
+        self.gesture_tree.bind("<ButtonPress-1>", self._gesture_tree_click, add="+")
+        self.gesture_tree.bind("<Double-1>", self._gesture_tree_double_click)
 
         hotkey_panel = ttk.LabelFrame(side, text="Hotkeys", padding=(8, 6))
         hotkey_panel.grid(row=4, column=0, sticky="ew", pady=(8, 4))
@@ -1544,10 +1549,7 @@ class VideoLabelEditor:
 
     def _bind_keys(self) -> None:
         bindings = {
-            "<space>": self.toggle_play, "<Left>": lambda: self.step(-1),
-            "<Right>": lambda: self.step(1), "j": lambda: self.step(-1),
-            "l": lambda: self.step(1), "a": lambda: self.step(-10),
-            "d": lambda: self.step(10), "b": self.begin_gesture,
+            "<space>": self.toggle_play, "b": self.begin_gesture,
             "e": self.end_gesture, "x": self.delete_gesture,
             "c": self.cancel_gesture,
             "<Delete>": self.delete_gesture,
@@ -1558,6 +1560,23 @@ class VideoLabelEditor:
         }
         for key, callback in bindings.items():
             self.root.bind(key, lambda _event, fn=callback: fn())
+        scrub_keys = {
+            "Left": -1,
+            "Right": 1,
+            "j": -1,
+            "l": 1,
+            "a": -10,
+            "d": 10,
+        }
+        for key, amount in scrub_keys.items():
+            self.root.bind(
+                f"<KeyPress-{key}>",
+                lambda event, step_amount=amount: self._start_scrub(event, step_amount),
+            )
+            self.root.bind(
+                f"<KeyRelease-{key}>",
+                self._stop_scrub,
+            )
 
     def set_message(self, text: str) -> None:
         self.status_var.set(text)
@@ -1642,7 +1661,15 @@ class VideoLabelEditor:
         selected = str(self.selected_gesture_id) if self.selected_gesture_id is not None else ""
         for item in self.gesture_tree.get_children():
             self.gesture_tree.delete(item)
-        for gesture in self.state.gestures:
+        sorted_gestures = sorted(
+            self.state.gestures,
+            key=lambda gesture: (
+                min(gesture.start_frame, gesture.end_frame),
+                max(gesture.start_frame, gesture.end_frame),
+                gesture.id,
+            ),
+        )
+        for gesture in sorted_gestures:
             self.gesture_tree.insert(
                 "", "end", iid=str(gesture.id),
                 values=(
@@ -1695,6 +1722,38 @@ class VideoLabelEditor:
             self.start_review()
         self._sync_controls()
         self.render_frame()
+
+    def _cancel_pending_deselect(self) -> None:
+        if self.gesture_deselect_after_id is not None:
+            try:
+                self.root.after_cancel(self.gesture_deselect_after_id)
+            except Exception:
+                pass
+        self.gesture_deselect_after_id = None
+
+    def _gesture_tree_click(self, event) -> None:
+        self._cancel_pending_deselect()
+        item = self.gesture_tree.identify_row(event.y)
+        if item and item in self.gesture_tree.selection():
+            self.gesture_deselect_after_id = self.root.after(
+                250, lambda iid=item: self._deselect_gesture(iid),
+            )
+
+    def _gesture_tree_double_click(self, _event=None) -> None:
+        self._cancel_pending_deselect()
+        self.start_review()
+
+    def _deselect_gesture(self, item: str) -> None:
+        self.gesture_deselect_after_id = None
+        if item not in self.gesture_tree.selection():
+            return
+        self.gesture_tree.selection_remove(item)
+        self.selected_gesture_id = None
+        if self.review_gesture_id is not None:
+            self.stop_review()
+        self._sync_controls()
+        self.render_frame()
+        self.set_message("Gesture deselected. Press B to begin a new label.")
 
     def goto_gesture(self) -> None:
         gesture = self._selected_gesture()
@@ -1771,6 +1830,36 @@ class VideoLabelEditor:
         self.playing = False
         self.play_button.configure(text="▶ Play")
         self.seek(self.frame_idx + amount)
+
+    def _start_scrub(self, event, amount: int) -> None:
+        key = event.keysym.lower()
+        if self.scrub_key == key:
+            return
+        self._stop_scrub()
+        self.scrub_key = key
+        self.scrub_amount = amount
+        self.step(amount)
+        self.scrub_after_id = self.root.after(220, self._scrub_tick)
+
+    def _scrub_tick(self) -> None:
+        if self.scrub_key is None:
+            return
+        self.step(self.scrub_amount)
+        # Schedule only after the current frame finishes rendering. This avoids
+        # accumulating repeated key events when decoding is slower than input.
+        self.scrub_after_id = self.root.after(45, self._scrub_tick)
+
+    def _stop_scrub(self, event=None) -> None:
+        if event is not None and self.scrub_key not in (None, event.keysym.lower()):
+            return
+        if self.scrub_after_id is not None:
+            try:
+                self.root.after_cancel(self.scrub_after_id)
+            except Exception:
+                pass
+        self.scrub_after_id = None
+        self.scrub_key = None
+        self.scrub_amount = 0
 
     def _slider_changed(self, value) -> None:
         start, end = self._playback_bounds()
@@ -2089,6 +2178,8 @@ class VideoLabelEditor:
 
     def close(self) -> None:
         self.playing = False
+        self._stop_scrub()
+        self._cancel_pending_deselect()
         if self.play_after_id is not None:
             try:
                 self.root.after_cancel(self.play_after_id)
