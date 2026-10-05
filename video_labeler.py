@@ -1422,10 +1422,27 @@ class VideoLabelEditor:
         self.canvas.bind("<Button-5>", lambda _e: self.step(1))
 
         side.columnconfigure(0, weight=1)
-        side.rowconfigure(2, weight=1)
-        ttk.Label(side, text="Gestures", font=("", 11, "bold")).grid(row=0, column=0, sticky="w", pady=(4, 6))
+        side.rowconfigure(3, weight=1)
+
+        indicator_panel = ttk.LabelFrame(side, text="Current frame", padding=(8, 6))
+        indicator_panel.grid(row=0, column=0, sticky="ew", pady=(4, 8))
+        indicator_panel.columnconfigure(0, weight=1)
+        self.applied_labels_var = tk.StringVar(value="Applied labels: none")
+        self.pending_gesture_var = tk.StringVar(value="Pending gesture: none")
+        ttk.Label(
+            indicator_panel, textvariable=self.applied_labels_var,
+            wraplength=320, justify="left",
+        ).grid(row=0, column=0, sticky="ew")
+        tree_style = ttk.Style(self.root)
+        tree_style.configure("PendingGesture.TLabel", foreground="#b35a00")
+        ttk.Label(
+            indicator_panel, textvariable=self.pending_gesture_var,
+            style="PendingGesture.TLabel", wraplength=320, justify="left",
+        ).grid(row=1, column=0, sticky="ew", pady=(4, 0))
+
+        ttk.Label(side, text="Gestures", font=("", 11, "bold")).grid(row=1, column=0, sticky="w", pady=(4, 6))
         gesture_buttons = ttk.Frame(side)
-        gesture_buttons.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        gesture_buttons.grid(row=2, column=0, sticky="ew", pady=(0, 6))
         for col in range(6):
             gesture_buttons.columnconfigure(col, weight=1)
         ttk.Button(gesture_buttons, text="Start (B)", command=self.begin_gesture).grid(row=0, column=0, sticky="ew")
@@ -1434,16 +1451,15 @@ class VideoLabelEditor:
         ttk.Button(gesture_buttons, text="Next", command=lambda: self.select_adjacent_gesture(1)).grid(row=0, column=3, sticky="ew")
         self.review_button = ttk.Button(gesture_buttons, text="Review window", command=self.toggle_review)
         self.review_button.grid(row=0, column=4, sticky="ew")
-        ttk.Button(gesture_buttons, text="Delete", command=self.delete_gesture).grid(row=0, column=5, sticky="ew")
+        ttk.Button(gesture_buttons, text="Remove label", command=self.delete_gesture).grid(row=0, column=5, sticky="ew")
 
         gesture_frame = ttk.Frame(side)
-        gesture_frame.grid(row=2, column=0, sticky="nsew")
+        gesture_frame.grid(row=3, column=0, sticky="nsew")
         gesture_frame.rowconfigure(0, weight=1)
         gesture_frame.columnconfigure(0, weight=1)
         default_font = self.tkfont.nametofont("TkDefaultFont", root=self.root)
         heading_font = self.tkfont.nametofont("TkHeadingFont", root=self.root)
         row_height = max(30, default_font.metrics("linespace") + 12)
-        tree_style = ttk.Style(self.root)
         tree_style.configure(
             "Gesture.Treeview",
             font=default_font,
@@ -1470,6 +1486,34 @@ class VideoLabelEditor:
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.gesture_tree.bind("<<TreeviewSelect>>", self._gesture_selected)
         self.gesture_tree.bind("<Double-1>", lambda _e: self.start_review())
+
+        hotkey_panel = ttk.LabelFrame(side, text="Hotkeys", padding=(8, 6))
+        hotkey_panel.grid(row=4, column=0, sticky="ew", pady=(8, 4))
+        hotkey_panel.columnconfigure(1, weight=1)
+        hotkey_font = self.tkfont.nametofont("TkFixedFont", root=self.root)
+        hotkeys = [
+            ("← / J", "Previous frame"),
+            ("→ / L", "Next frame"),
+            ("A / D", "Back / forward 10 frames"),
+            ("Mouse wheel", "Scrub one frame"),
+            ("Space", "Play / pause"),
+            ("B / E", "Set gesture start / end"),
+            ("C", "Cancel pending gesture start"),
+            ("X / Delete", "Remove selected label"),
+            ("N", "Start a new object track"),
+            ("R", "Review selected time window"),
+            ("P", "Initialize / propagate SAM2"),
+            ("S", "Save"),
+            ("I", "Save as in progress and close"),
+            ("Q / Esc", "Save as completed and close"),
+        ]
+        for row, (keys, action) in enumerate(hotkeys):
+            ttk.Label(hotkey_panel, text=keys, font=hotkey_font).grid(
+                row=row, column=0, sticky="w", padx=(0, 12), pady=1,
+            )
+            ttk.Label(hotkey_panel, text=action).grid(
+                row=row, column=1, sticky="w", pady=1,
+            )
 
         transport = ttk.Frame(self.root, padding=(8, 6))
         transport.grid(row=2, column=0, sticky="ew")
@@ -1505,6 +1549,8 @@ class VideoLabelEditor:
             "l": lambda: self.step(1), "a": lambda: self.step(-10),
             "d": lambda: self.step(10), "b": self.begin_gesture,
             "e": self.end_gesture, "x": self.delete_gesture,
+            "c": self.cancel_gesture,
+            "<Delete>": self.delete_gesture,
             "n": self.new_track, "p": self.sam2_propagate, "s": self.save,
             "i": self.save_in_progress, "q": self.finish,
             "<Escape>": self.finish,
@@ -1553,7 +1599,32 @@ class VideoLabelEditor:
         self._refresh_tracks()
         self._refresh_gestures()
         self._sync_controls()
+        self._update_label_indicators()
         self.render_frame()
+
+    def _update_label_indicators(self) -> None:
+        applied = []
+        for gesture in self.state.gestures:
+            start = min(gesture.start_frame, gesture.end_frame)
+            end = max(gesture.start_frame, gesture.end_frame)
+            if start <= self.frame_idx <= end:
+                name = category_name(self.config.gesture_categories, gesture.category_id)
+                applied.append(f"G{gesture.id}: {name} [{start + 1}–{end + 1}]")
+        for track, _rect in self._tracks_on_frame():
+            name = category_name(self.config.object_categories, track.category_id)
+            applied.append(f"T{track.id}: {name}")
+        self.applied_labels_var.set(
+            "Applied labels: " + (", ".join(applied) if applied else "none")
+        )
+        if self.gesture_start is None:
+            self.pending_gesture_var.set("Pending gesture: none")
+        else:
+            index = max(0, self.gesture_type_combo.current())
+            name = self.config.gesture_categories[index].name
+            self.pending_gesture_var.set(
+                f"Pending gesture: {name}, starting at frame "
+                f"{self.gesture_start + 1} — press E to finish or C to cancel"
+            )
 
     def _refresh_tracks(self) -> None:
         values = ["New track"] + [
@@ -1615,6 +1686,7 @@ class VideoLabelEditor:
             self.dirty = True
             self._refresh_gestures()
             self.render_frame()
+        self._update_label_indicators()
 
     def _gesture_selected(self, _event=None) -> None:
         selection = self.gesture_tree.selection()
@@ -1692,6 +1764,7 @@ class VideoLabelEditor:
         self.frame_idx = clamp(int(index), start, end)
         self.frame_var.set(self.frame_idx)
         self._update_frame_label()
+        self._update_label_indicators()
         self.render_frame()
 
     def step(self, amount: int) -> None:
@@ -1705,6 +1778,7 @@ class VideoLabelEditor:
         if index != self.frame_idx:
             self.frame_idx = index
             self._update_frame_label()
+            self._update_label_indicators()
             self.render_frame()
 
     def toggle_play(self) -> None:
@@ -1884,6 +1958,21 @@ class VideoLabelEditor:
         self.canvas_offset = (ox, oy)
         self.canvas.delete("all")
         self.canvas.create_image(ox, oy, image=self.photo, anchor="nw")
+        indicator_lines = [self.applied_labels_var.get()]
+        if self.gesture_start is not None:
+            indicator_lines.append(self.pending_gesture_var.get())
+        indicator_text = "\n".join(indicator_lines)
+        text_id = self.canvas.create_text(
+            ox + 10, oy + 10, text=indicator_text, anchor="nw",
+            fill="white", font=("TkDefaultFont", 10, "bold"), width=max(100, display_size[0] - 20),
+        )
+        bounds = self.canvas.bbox(text_id)
+        if bounds:
+            background = self.canvas.create_rectangle(
+                bounds[0] - 6, bounds[1] - 4, bounds[2] + 6, bounds[3] + 4,
+                fill="#202020", outline="#f0a000" if self.gesture_start is not None else "#707070",
+            )
+            self.canvas.tag_lower(background, text_id)
 
     def new_track(self) -> None:
         self.active_track_id = None
@@ -1902,6 +1991,18 @@ class VideoLabelEditor:
         else:
             self.gesture_start = self.frame_idx
             self.set_message(f"Gesture start set to frame {self.frame_idx + 1}.")
+        self._update_label_indicators()
+        self.render_frame()
+
+    def cancel_gesture(self) -> None:
+        if self.gesture_start is None:
+            self.set_message("No pending gesture start to cancel.")
+            return
+        start = self.gesture_start
+        self.gesture_start = None
+        self._update_label_indicators()
+        self.render_frame()
+        self.set_message(f"Canceled gesture start at frame {start + 1}.")
 
     def end_gesture(self) -> None:
         gesture = self._selected_gesture()
@@ -1911,6 +2012,8 @@ class VideoLabelEditor:
             self._refresh_gestures()
             if self.review_gesture_id == gesture.id:
                 self.start_review()
+            self._update_label_indicators()
+            self.render_frame()
             self.set_message(f"Gesture {gesture.id} end updated.")
             return
         if self.gesture_start is None:
@@ -1926,6 +2029,8 @@ class VideoLabelEditor:
         self.gesture_start = None
         self.dirty = True
         self._refresh_gestures()
+        self._update_label_indicators()
+        self.render_frame()
         self.set_message("Gesture added.")
 
     def delete_gesture(self) -> None:
@@ -1939,7 +2044,9 @@ class VideoLabelEditor:
         self.selected_gesture_id = None
         self.dirty = True
         self._refresh_gestures()
-        self.set_message("Gesture deleted.")
+        self._update_label_indicators()
+        self.render_frame()
+        self.set_message("Gesture label removed.")
 
     def save(self, status: Optional[str] = None) -> None:
         if status:

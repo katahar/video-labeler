@@ -106,6 +106,9 @@ Menu:
 Editor:
 
 - native Tkinter toolbar, comboboxes, timeline, buttons, and scrollable gesture table
+- an always-visible **Hotkeys** panel below the gesture table lists frame scrubbing, playback, editing, review, SAM2, and save/exit shortcuts
+- the **Current frame** panel and video overlay show gesture/object labels already applied at the displayed frame
+- after `B` starts a gesture, an orange pending indicator shows its type and start frame; press `C` to cancel an accidental start
 - **Rotate preview 90°** rotates only the displayed video; repeated clicks cycle through 0°, 90°, 180°, and 270° without modifying the source video or saved annotation coordinates
 - mouse drag: draw a box, or move an existing box
 - right click: delete the box on the current frame
@@ -116,6 +119,7 @@ Editor:
 - `B`: begin gesture range at current frame
 - `E`: end gesture range at current frame
 - `X`: delete the selected gesture
+- `Delete`: remove the selected gesture label from the list
 - `P`: initialize SAM2 from the active box and propagate it forward; propagated boxes remain draggable for correction, and `P` can be used again from a corrected box
 - `S`: save annotations
 - use the toolbar comboboxes to select object types, gesture types, and tracks
