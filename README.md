@@ -121,12 +121,15 @@ Editor:
 - `E`: end gesture range at current frame
 - `X`: delete the selected gesture
 - `Delete`: remove the selected gesture label from the list
+- `V`: toggle possession between wearer and non-wearer for the new or selected label
+- `U`: switch to non-wearer and focus the identity field; type an identity and press Enter
 - `P`: initialize SAM2 from the active box and propagate it forward; propagated boxes remain draggable for correction, and `P` can be used again from a corrected box
 - `S`: save annotations
 - use the toolbar comboboxes to select object types, gesture types, and tracks
 - use the scrollable gesture table to browse and edit any number of labeled gestures
 - gesture labels in the right panel are sorted chronologically by their start frame
 - click an already selected gesture a second time to deselect it; `B` will then begin a new label instead of editing the existing one
+- deselection clears the gesture table's keyboard focus, so frame hotkeys cannot silently reselect the last row
 - completing a new gesture leaves the list unselected, allowing repeated `B`/`E` labeling without clicking the list between instances
 - gesture table rows size themselves from the active Tk font so values remain readable with display scaling and larger system fonts
 - select an existing gesture and click **Review window** (or double-click it) to constrain the timeline and playback to that instance's exact start/end frames
@@ -155,5 +158,9 @@ The JSON contains:
 - `tracks`: compact track-centric bounding-box records,
 - `gesture_categories`: configured gesture labels,
 - `gestures`: frame-range gesture annotations.
+
+Each gesture also stores `possession` (`wearer` or `non_wearer`) and
+`possessor_identity`. Older annotations without these fields load as
+`wearer`.
 
 Bounding boxes use COCO `[x, y, width, height]` pixel coordinates. Gesture ranges use inclusive zero-based `start_frame` and `end_frame`.

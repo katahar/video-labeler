@@ -93,6 +93,8 @@ class GestureRange:
     category_id: int
     start_frame: int
     end_frame: int
+    possession: str = "wearer"
+    possessor_identity: str = ""
 
 
 @dataclass
@@ -645,6 +647,8 @@ def serialize_annotations(state: AnnotationState) -> Dict:
                 "category_id": gesture.category_id,
                 "start_frame": min(gesture.start_frame, gesture.end_frame),
                 "end_frame": max(gesture.start_frame, gesture.end_frame),
+                "possession": gesture.possession,
+                "possessor_identity": gesture.possessor_identity,
             }
             for gesture in state.gestures
         ],
@@ -712,11 +716,20 @@ def load_annotations(
     for item in payload.get("gestures", []):
         if not isinstance(item, dict):
             continue
+        possession = str(item.get("possession", "wearer")).strip().lower()
+        if possession not in {"wearer", "non_wearer"}:
+            possession = "wearer"
         gesture = GestureRange(
             id=int(item.get("id", state.next_gesture_id)),
             category_id=int(item.get("category_id", config.gesture_categories[0].id)),
             start_frame=clamp(int(item.get("start_frame", 0)), 0, max(frame_count - 1, 0)),
             end_frame=clamp(int(item.get("end_frame", 0)), 0, max(frame_count - 1, 0)),
+            possession=possession,
+            possessor_identity=(
+                str(item.get("possessor_identity", "")).strip()
+                if possession == "non_wearer"
+                else ""
+            ),
         )
         state.gestures.append(gesture)
 
@@ -1406,10 +1419,33 @@ class VideoLabelEditor:
         self.rotate_button = ttk.Button(toolbar, text="Rotate preview 90°", command=self.rotate_preview)
         self.rotate_button.grid(row=0, column=8, padx=3)
 
+        ttk.Label(toolbar, text="Possession").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.possession_var = tk.StringVar(value="Wearer")
+        self.possession_combo = ttk.Combobox(
+            toolbar, textvariable=self.possession_var, state="readonly",
+            values=("Wearer", "Non-wearer"),
+        )
+        self.possession_combo.current(0)
+        self.possession_combo.grid(row=1, column=1, sticky="ew", padx=(4, 12), pady=(8, 0))
+        self.possession_combo.bind("<<ComboboxSelected>>", self._possession_changed)
+
+        ttk.Label(toolbar, text="Non-wearer identity").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        self.possessor_identity_var = tk.StringVar()
+        self.possessor_identity_combo = ttk.Combobox(
+            toolbar, textvariable=self.possessor_identity_var, state="disabled",
+        )
+        self.possessor_identity_combo.grid(
+            row=1, column=3, columnspan=3, sticky="ew",
+            padx=(4, 12), pady=(8, 0),
+        )
+        self.possessor_identity_combo.bind("<<ComboboxSelected>>", self._possessor_identity_changed)
+        self.possessor_identity_combo.bind("<FocusOut>", self._possessor_identity_changed)
+        self.possessor_identity_combo.bind("<Return>", self._possessor_identity_changed)
+
         body = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         body.grid(row=1, column=0, sticky="nsew", padx=8)
         video_panel = ttk.Frame(body)
-        side = ttk.Frame(body, width=340)
+        side = ttk.Frame(body, width=430)
         body.add(video_panel, weight=4)
         body.add(side, weight=1)
         video_panel.rowconfigure(0, weight=1)
@@ -1436,13 +1472,13 @@ class VideoLabelEditor:
         self.pending_gesture_var = tk.StringVar(value="Pending gesture: none")
         ttk.Label(
             indicator_panel, textvariable=self.applied_labels_var,
-            wraplength=320, justify="left",
+            wraplength=400, justify="left",
         ).grid(row=0, column=0, sticky="ew")
         tree_style = ttk.Style(self.root)
         tree_style.configure("PendingGesture.TLabel", foreground="#b35a00")
         ttk.Label(
             indicator_panel, textvariable=self.pending_gesture_var,
-            style="PendingGesture.TLabel", wraplength=320, justify="left",
+            style="PendingGesture.TLabel", wraplength=400, justify="left",
         ).grid(row=1, column=0, sticky="ew", pady=(4, 0))
 
         ttk.Label(side, text="Gestures", font=("", 11, "bold")).grid(row=1, column=0, sticky="w", pady=(4, 6))
@@ -1476,13 +1512,15 @@ class VideoLabelEditor:
             padding=(6, 7),
         )
         self.gesture_tree = ttk.Treeview(
-            gesture_frame, columns=("type", "start", "end"), show="headings",
+            gesture_frame, columns=("type", "possession", "start", "end"), show="headings",
             selectmode="browse", style="Gesture.Treeview",
         )
         self.gesture_tree.heading("type", text="Type")
+        self.gesture_tree.heading("possession", text="Possession")
         self.gesture_tree.heading("start", text="Start")
         self.gesture_tree.heading("end", text="End")
-        self.gesture_tree.column("type", width=150, stretch=True)
+        self.gesture_tree.column("type", width=110, stretch=True)
+        self.gesture_tree.column("possession", width=130, stretch=True)
         self.gesture_tree.column("start", width=60, anchor="e")
         self.gesture_tree.column("end", width=60, anchor="e")
         scrollbar = ttk.Scrollbar(gesture_frame, orient="vertical", command=self.gesture_tree.yview)
@@ -1506,6 +1544,8 @@ class VideoLabelEditor:
             ("B / E", "Set gesture start / end"),
             ("C", "Cancel pending gesture start"),
             ("X / Delete", "Remove selected label"),
+            ("V", "Toggle wearer / non-wearer"),
+            ("U", "Enter non-wearer identity"),
             ("N", "Start a new object track"),
             ("R", "Review selected time window"),
             ("P", "Initialize / propagate SAM2"),
@@ -1558,9 +1598,13 @@ class VideoLabelEditor:
             "i": self.save_in_progress, "q": self.finish,
             "<Escape>": self.finish,
             "r": self.toggle_review,
+            "v": self.toggle_possession,
+            "u": self.focus_possessor_identity,
         }
         for key, callback in bindings.items():
-            self.root.bind(key, lambda _event, fn=callback: fn())
+            handler = lambda event, fn=callback: self._invoke_hotkey(event, fn)
+            self.root.bind(key, handler)
+            self.gesture_tree.bind(key, handler)
         scrub_keys = {
             "Left": -1,
             "Right": 1,
@@ -1578,10 +1622,29 @@ class VideoLabelEditor:
                 f"<KeyRelease-{key}>",
                 self._scrub_key_released,
             )
+            self.gesture_tree.bind(
+                f"<KeyPress-{key}>",
+                lambda event, step_amount=amount: self._tree_scrub_press(event, step_amount),
+            )
+            self.gesture_tree.bind(
+                f"<KeyRelease-{key}>",
+                self._tree_scrub_release,
+            )
 
     def set_message(self, text: str) -> None:
         self.status_var.set(text)
         print(text)
+
+    def _hotkey_allowed(self, event) -> bool:
+        return event.widget.winfo_class() not in {
+            "Entry", "TEntry", "TCombobox", "Text", "Spinbox", "TSpinbox",
+        }
+
+    def _invoke_hotkey(self, event, callback):
+        if not self._hotkey_allowed(event):
+            return None
+        callback()
+        return "break"
 
     def _category_index(self, categories: List[Category], category_id: int) -> int:
         return next((i for i, c in enumerate(categories) if c.id == category_id), 0)
@@ -1629,7 +1692,10 @@ class VideoLabelEditor:
             end = max(gesture.start_frame, gesture.end_frame)
             if start <= self.frame_idx <= end:
                 name = category_name(self.config.gesture_categories, gesture.category_id)
-                applied.append(f"G{gesture.id}: {name} [{start + 1}–{end + 1}]")
+                applied.append(
+                    f"G{gesture.id}: {name}, {self._possession_display(gesture)} "
+                    f"[{start + 1}–{end + 1}]"
+                )
         for track, _rect in self._tracks_on_frame():
             name = category_name(self.config.object_categories, track.category_id)
             applied.append(f"T{track.id}: {name}")
@@ -1641,8 +1707,13 @@ class VideoLabelEditor:
         else:
             index = max(0, self.gesture_type_combo.current())
             name = self.config.gesture_categories[index].name
+            if self.possession_combo.current() == 1:
+                identity = self.possessor_identity_var.get().strip()
+                possession = f"Non-wearer: {identity}" if identity else "Non-wearer"
+            else:
+                possession = "Wearer"
             self.pending_gesture_var.set(
-                f"Pending gesture: {name}, starting at frame "
+                f"Pending gesture: {name}, {possession}, starting at frame "
                 f"{self.gesture_start + 1} — press E to finish or C to cancel"
             )
 
@@ -1675,6 +1746,7 @@ class VideoLabelEditor:
                 "", "end", iid=str(gesture.id),
                 values=(
                     category_name(self.config.gesture_categories, gesture.category_id),
+                    self._possession_display(gesture),
                     min(gesture.start_frame, gesture.end_frame) + 1,
                     max(gesture.start_frame, gesture.end_frame) + 1,
                 ),
@@ -1682,6 +1754,23 @@ class VideoLabelEditor:
         if selected and self.gesture_tree.exists(selected):
             self.gesture_tree.selection_set(selected)
             self.gesture_tree.see(selected)
+        else:
+            self._clear_gesture_selection()
+        identities = sorted({
+            gesture.possessor_identity
+            for gesture in self.state.gestures
+            if gesture.possession == "non_wearer" and gesture.possessor_identity
+        })
+        self.possessor_identity_combo["values"] = identities
+
+    def _possession_display(self, gesture: GestureRange) -> str:
+        if gesture.possession != "non_wearer":
+            return "Wearer"
+        return (
+            f"Non-wearer: {gesture.possessor_identity}"
+            if gesture.possessor_identity
+            else "Non-wearer"
+        )
 
     def _sync_controls(self) -> None:
         track = self.state.track_by_id(self.active_track_id) if self.active_track_id else None
@@ -1690,6 +1779,12 @@ class VideoLabelEditor:
         gesture = self._selected_gesture()
         gesture_id = gesture.category_id if gesture else self.config.gesture_categories[0].id
         self.gesture_type_combo.current(self._category_index(self.config.gesture_categories, gesture_id))
+        possession = gesture.possession if gesture is not None else "wearer"
+        self.possession_combo.current(1 if possession == "non_wearer" else 0)
+        self.possessor_identity_var.set(
+            gesture.possessor_identity if gesture is not None and possession == "non_wearer" else ""
+        )
+        self._update_possessor_identity_state()
         self.frame_var.set(self.frame_idx)
         self._update_frame_label()
 
@@ -1715,6 +1810,55 @@ class VideoLabelEditor:
             self._refresh_gestures()
             self.render_frame()
         self._update_label_indicators()
+
+    def _update_possessor_identity_state(self) -> None:
+        state = "normal" if self.possession_combo.current() == 1 else "disabled"
+        self.possessor_identity_combo.configure(state=state)
+
+    def _possession_changed(self, _event=None) -> None:
+        possession = "non_wearer" if self.possession_combo.current() == 1 else "wearer"
+        if possession == "wearer":
+            self.possessor_identity_var.set("")
+        self._update_possessor_identity_state()
+        gesture = self._selected_gesture()
+        if gesture is not None:
+            gesture.possession = possession
+            gesture.possessor_identity = (
+                self.possessor_identity_var.get().strip()
+                if possession == "non_wearer"
+                else ""
+            )
+            self.dirty = True
+            self._refresh_gestures()
+        self._update_label_indicators()
+        self.render_frame()
+
+    def _possessor_identity_changed(self, _event=None) -> None:
+        if self.possession_combo.current() != 1:
+            return
+        identity = self.possessor_identity_var.get().strip()
+        self.possessor_identity_var.set(identity)
+        gesture = self._selected_gesture()
+        if gesture is not None:
+            gesture.possession = "non_wearer"
+            gesture.possessor_identity = identity
+            self.dirty = True
+            self._refresh_gestures()
+            self._update_label_indicators()
+            self.render_frame()
+
+    def toggle_possession(self) -> None:
+        self.possession_combo.current(0 if self.possession_combo.current() == 1 else 1)
+        self._possession_changed()
+        self.set_message(f"Possession set to {self.possession_var.get()}.")
+
+    def focus_possessor_identity(self) -> None:
+        if self.possession_combo.current() != 1:
+            self.possession_combo.current(1)
+            self._possession_changed()
+        self.possessor_identity_combo.focus_set()
+        self.possessor_identity_combo.icursor("end")
+        self.set_message("Enter the non-wearer identity, then press Enter.")
 
     def _gesture_selected(self, _event=None) -> None:
         selection = self.gesture_tree.selection()
@@ -1748,13 +1892,20 @@ class VideoLabelEditor:
         self.gesture_deselect_after_id = None
         if item not in self.gesture_tree.selection():
             return
-        self.gesture_tree.selection_remove(item)
-        self.selected_gesture_id = None
+        self._clear_gesture_selection()
         if self.review_gesture_id is not None:
             self.stop_review()
         self._sync_controls()
         self.render_frame()
         self.set_message("Gesture deselected. Press B to begin a new label.")
+
+    def _clear_gesture_selection(self) -> None:
+        selected_items = self.gesture_tree.selection()
+        if selected_items:
+            self.gesture_tree.selection_remove(*selected_items)
+        self.gesture_tree.focus("")
+        self.selected_gesture_id = None
+        self.canvas.focus_set()
 
     def goto_gesture(self) -> None:
         gesture = self._selected_gesture()
@@ -1833,6 +1984,8 @@ class VideoLabelEditor:
         self.seek(self.frame_idx + amount)
 
     def _start_scrub(self, event, amount: int) -> None:
+        if not self._hotkey_allowed(event):
+            return
         key = event.keysym.lower()
         self._cancel_scrub_release()
         if self.scrub_key == key:
@@ -1842,6 +1995,15 @@ class VideoLabelEditor:
         self.scrub_amount = amount
         self.step(amount)
         self.scrub_after_id = self.root.after(220, self._scrub_tick)
+        return "break"
+
+    def _tree_scrub_press(self, event, amount: int):
+        self._start_scrub(event, amount)
+        return "break"
+
+    def _tree_scrub_release(self, event):
+        self._scrub_key_released(event)
+        return "break"
 
     def _scrub_tick(self) -> None:
         if self.scrub_key is None:
@@ -2134,18 +2296,26 @@ class VideoLabelEditor:
             self.set_message("Set a gesture start first.")
             return
         category_id = self.config.gesture_categories[self.gesture_type_combo.current()].id
+        possession = "non_wearer" if self.possession_combo.current() == 1 else "wearer"
+        possessor_identity = (
+            self.possessor_identity_var.get().strip()
+            if possession == "non_wearer"
+            else ""
+        )
         gesture = GestureRange(
-            self.state.next_gesture_id, category_id, self.gesture_start, self.frame_idx,
+            id=self.state.next_gesture_id,
+            category_id=category_id,
+            start_frame=self.gesture_start,
+            end_frame=self.frame_idx,
+            possession=possession,
+            possessor_identity=possessor_identity,
         )
         self.state.next_gesture_id += 1
         self.state.gestures.append(gesture)
-        self.selected_gesture_id = None
         self.gesture_start = None
         self.dirty = True
         self._refresh_gestures()
-        selected_items = self.gesture_tree.selection()
-        if selected_items:
-            self.gesture_tree.selection_remove(*selected_items)
+        self._clear_gesture_selection()
         self._update_label_indicators()
         self.render_frame()
         self.set_message(
@@ -2163,6 +2333,7 @@ class VideoLabelEditor:
         self.selected_gesture_id = None
         self.dirty = True
         self._refresh_gestures()
+        self._clear_gesture_selection()
         self._update_label_indicators()
         self.render_frame()
         self.set_message("Gesture label removed.")
