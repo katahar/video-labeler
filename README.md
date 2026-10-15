@@ -136,6 +136,8 @@ Editor:
 - use **Previous** and **Next** to move between labeled instances; while reviewing, the next selected instance immediately becomes the active review window
 - playback stops at the selected instance's end; clicking **Exit review** restores the full-video timeline
 - after selecting an existing gesture, `B` and `E` move its start and end; selecting a gesture type relabels it
+- start and end remain explicit endpoints when displayed and saved; valid endpoint edits are never reordered with `min/max`
+- edits that would reverse a gesture window are rejected instead of silently swapping the labels; reversed legacy ranges are normalized once when loaded
 - `I`: save as in progress and return to the menu (the video remains eligible for `n`)
 - `Q` or `Esc`: save as completed and return to the menu
 

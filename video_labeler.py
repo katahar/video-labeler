@@ -645,8 +645,8 @@ def serialize_annotations(state: AnnotationState) -> Dict:
             {
                 "id": gesture.id,
                 "category_id": gesture.category_id,
-                "start_frame": min(gesture.start_frame, gesture.end_frame),
-                "end_frame": max(gesture.start_frame, gesture.end_frame),
+                "start_frame": gesture.start_frame,
+                "end_frame": gesture.end_frame,
                 "possession": gesture.possession,
                 "possessor_identity": gesture.possessor_identity,
             }
@@ -719,11 +719,17 @@ def load_annotations(
         possession = str(item.get("possession", "wearer")).strip().lower()
         if possession not in {"wearer", "non_wearer"}:
             possession = "wearer"
+        start_frame = clamp(
+            int(item.get("start_frame", 0)), 0, max(frame_count - 1, 0),
+        )
+        end_frame = clamp(
+            int(item.get("end_frame", 0)), 0, max(frame_count - 1, 0),
+        )
         gesture = GestureRange(
             id=int(item.get("id", state.next_gesture_id)),
             category_id=int(item.get("category_id", config.gesture_categories[0].id)),
-            start_frame=clamp(int(item.get("start_frame", 0)), 0, max(frame_count - 1, 0)),
-            end_frame=clamp(int(item.get("end_frame", 0)), 0, max(frame_count - 1, 0)),
+            start_frame=min(start_frame, end_frame),
+            end_frame=max(start_frame, end_frame),
             possession=possession,
             possessor_identity=(
                 str(item.get("possessor_identity", "")).strip()
@@ -1659,10 +1665,7 @@ class VideoLabelEditor:
         gesture = self._review_gesture()
         if gesture is None:
             return 0, max(0, self.frame_count - 1)
-        return (
-            min(gesture.start_frame, gesture.end_frame),
-            max(gesture.start_frame, gesture.end_frame),
-        )
+        return gesture.start_frame, gesture.end_frame
 
     def _update_frame_label(self) -> None:
         start, end = self._playback_bounds()
@@ -1688,8 +1691,8 @@ class VideoLabelEditor:
     def _update_label_indicators(self) -> None:
         applied = []
         for gesture in self.state.gestures:
-            start = min(gesture.start_frame, gesture.end_frame)
-            end = max(gesture.start_frame, gesture.end_frame)
+            start = gesture.start_frame
+            end = gesture.end_frame
             if start <= self.frame_idx <= end:
                 name = category_name(self.config.gesture_categories, gesture.category_id)
                 applied.append(
@@ -1736,8 +1739,8 @@ class VideoLabelEditor:
         sorted_gestures = sorted(
             self.state.gestures,
             key=lambda gesture: (
-                min(gesture.start_frame, gesture.end_frame),
-                max(gesture.start_frame, gesture.end_frame),
+                gesture.start_frame,
+                gesture.end_frame,
                 gesture.id,
             ),
         )
@@ -1747,8 +1750,8 @@ class VideoLabelEditor:
                 values=(
                     category_name(self.config.gesture_categories, gesture.category_id),
                     self._possession_display(gesture),
-                    min(gesture.start_frame, gesture.end_frame) + 1,
-                    max(gesture.start_frame, gesture.end_frame) + 1,
+                    gesture.start_frame + 1,
+                    gesture.end_frame + 1,
                 ),
             )
         if selected and self.gesture_tree.exists(selected):
@@ -1910,12 +1913,12 @@ class VideoLabelEditor:
     def goto_gesture(self) -> None:
         gesture = self._selected_gesture()
         if gesture is not None:
-            self.seek(min(gesture.start_frame, gesture.end_frame))
+            self.seek(gesture.start_frame)
 
     def select_adjacent_gesture(self, direction: int) -> None:
         gestures = sorted(
             self.state.gestures,
-            key=lambda gesture: (min(gesture.start_frame, gesture.end_frame), gesture.id),
+            key=lambda gesture: (gesture.start_frame, gesture.id),
         )
         if not gestures:
             self.set_message("There are no labeled gesture instances.")
@@ -2076,8 +2079,7 @@ class VideoLabelEditor:
                 gesture = self._review_gesture()
                 self.set_message(
                     f"Review complete: G{gesture.id}, frames "
-                    f"{min(gesture.start_frame, gesture.end_frame) + 1}–"
-                    f"{max(gesture.start_frame, gesture.end_frame) + 1}."
+                    f"{gesture.start_frame + 1}–{gesture.end_frame + 1}."
                 )
             return
         self.seek(self.frame_idx + 1)
@@ -2258,6 +2260,12 @@ class VideoLabelEditor:
     def begin_gesture(self) -> None:
         gesture = self._selected_gesture()
         if gesture is not None:
+            if self.frame_idx > gesture.end_frame:
+                self.set_message(
+                    f"Start frame must be at or before frame {gesture.end_frame + 1}. "
+                    "The gesture was not changed."
+                )
+                return
             gesture.start_frame = self.frame_idx
             self.dirty = True
             self._refresh_gestures()
@@ -2283,6 +2291,12 @@ class VideoLabelEditor:
     def end_gesture(self) -> None:
         gesture = self._selected_gesture()
         if gesture is not None:
+            if self.frame_idx < gesture.start_frame:
+                self.set_message(
+                    f"End frame must be at or after frame {gesture.start_frame + 1}. "
+                    "The gesture was not changed."
+                )
+                return
             gesture.end_frame = self.frame_idx
             self.dirty = True
             self._refresh_gestures()
@@ -2294,6 +2308,12 @@ class VideoLabelEditor:
             return
         if self.gesture_start is None:
             self.set_message("Set a gesture start first.")
+            return
+        if self.frame_idx < self.gesture_start:
+            self.set_message(
+                f"End frame must be at or after frame {self.gesture_start + 1}. "
+                "The pending start remains active; scrub forward or press C to cancel."
+            )
             return
         category_id = self.config.gesture_categories[self.gesture_type_combo.current()].id
         possession = "non_wearer" if self.possession_combo.current() == 1 else "wearer"
